@@ -89,10 +89,39 @@ def 收集配置():
     bili_jct = 询问("请输入 bili_jct")
     buvid3   = 询问("请输入 buvid3")
 
-    bvid = 询问("请输入目标视频 BV 号（如 BV1fSGJ69EbE）")
-    while not bvid:
-        print("  BV 号不能为空，请重新输入。")
-        bvid = 询问("请输入目标视频 BV 号")
+    # 选择评论区类型
+    print("-" * 50)
+    print("请选择要抓取的评论区类型：")
+    print("  1 = 视频评论区（输入 BV 号）")
+    print("  2 = 动态评论区 - 转发/纯文字类（输入动态 ID）")
+    print("  3 = 动态评论区 - 图文相册类（输入动态 ID）")
+    print("  提示：动态 ID 是动态链接 t.bilibili.com/ 后面那串数字。")
+    print("        若类型 2 抓不到评论，请改用类型 3，反之亦然。")
+    while True:
+        类型选择 = 询问("请选择（1 / 2 / 3）", "1")
+        if 类型选择 in ("1", "2", "3"):
+            break
+        print("  请输入 1、2 或 3。")
+
+    bvid = ""        # 仅视频用
+    oid_直填 = None   # 动态用，直接就是 oid
+    if 类型选择 == "1":
+        评论类型 = 1
+        bvid = 询问("请输入目标视频 BV 号（如 BV1fSGJ69EbE）")
+        while not bvid:
+            print("  BV 号不能为空，请重新输入。")
+            bvid = 询问("请输入目标视频 BV 号")
+        目标标识 = bvid
+    else:
+        评论类型 = 17 if 类型选择 == "2" else 11
+        while True:
+            动态id = 询问("请输入动态 ID（链接 t.bilibili.com/ 后的数字串）")
+            动态id = 动态id.strip()
+            if 动态id.isdigit():
+                oid_直填 = int(动态id)
+                break
+            print("  动态 ID 应该是一串纯数字，请重新输入。")
+        目标标识 = f"dyn{oid_直填}"
 
     while True:
         原始 = 询问("最多抓取多少条主评论（0 表示不限制，抓到底）", 默认最大条数)
@@ -131,7 +160,10 @@ def 收集配置():
     print("-" * 50)
     return {
         "凭证": Credential(sessdata=sessdata, bili_jct=bili_jct, buvid3=buvid3),
-        "bvid": bvid,
+        "评论类型": 评论类型,        # 1=视频 17=转发动态 11=图文动态
+        "bvid": bvid,               # 仅视频类型有值
+        "oid_直填": oid_直填,        # 动态类型的 oid（视频为 None）
+        "目标标识": 目标标识,        # 用于缓存文件命名
         "最大条数": 最大条数,
         "请求间隔秒": 延迟,
         "保留内容": 保留内容,
@@ -240,12 +272,22 @@ async def 获取wbi密钥(凭证) -> tuple[str, str]:
 
 async def 抓取评论(cfg: dict, conn: sqlite3.Connection):
     凭证    = cfg["凭证"]
+    评论类型 = cfg["评论类型"]
     bvid    = cfg["bvid"]
     最大条数 = cfg["最大条数"]
     间隔    = cfg["请求间隔秒"]
 
-    v = video.Video(bvid=bvid, credential=凭证)
-    aid = await v.get_aid() if asyncio.iscoroutinefunction(v.get_aid) else v.get_aid()
+    # 确定 oid 与 referer
+    if 评论类型 == 1:
+        v = video.Video(bvid=bvid, credential=凭证)
+        oid = await v.get_aid() if asyncio.iscoroutinefunction(v.get_aid) else v.get_aid()
+        referer = f"https://www.bilibili.com/video/{bvid}"
+        目标描述 = f"视频 {bvid}（aid={oid}）"
+    else:
+        oid = cfg["oid_直填"]
+        referer = f"https://t.bilibili.com/{oid}"
+        类型名 = "转发/纯文字动态" if 评论类型 == 17 else "图文相册动态"
+        目标描述 = f"{类型名}（oid={oid}，type={评论类型}）"
 
     print("正在获取 WBI 签名密钥……")
     img_key, sub_key = await 获取wbi密钥(凭证)
@@ -255,7 +297,7 @@ async def 抓取评论(cfg: dict, conn: sqlite3.Connection):
     if 总数 > 0:
         print(f"检测到上次进度：已抓 {总数} 条，从游标 {next_offset} 处续抓……")
     else:
-        print(f"开始抓取视频 {bvid}（aid={aid}）的全量主评论……")
+        print(f"开始抓取 {目标描述} 的全量主评论……")
 
     限制说明 = f"最多 {最大条数} 条" if 最大条数 > 0 else "不限制，抓到底"
     print(f"抓取上限：{限制说明}")
@@ -265,7 +307,7 @@ async def 抓取评论(cfg: dict, conn: sqlite3.Connection):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
-        "Referer": f"https://www.bilibili.com/video/{bvid}",
+        "Referer": referer,
     }
     cookies = {
         "SESSDATA": 凭证.sessdata,
@@ -283,7 +325,7 @@ async def 抓取评论(cfg: dict, conn: sqlite3.Connection):
                     break
 
                 params = wbi签名(
-                    {"oid": aid, "type": 1, "mode": 3, "next": next_offset},
+                    {"oid": oid, "type": 评论类型, "mode": 3, "next": next_offset},
                     img_key, sub_key,
                 )
 
@@ -410,10 +452,10 @@ def 导出xlsx(行列表, 文件名, 保留内容=True):
 
 async def 异步主流程():
     cfg = 收集配置()
-    bvid = cfg["bvid"]
+    目标标识 = cfg["目标标识"]
 
-    # 数据库文件名与 BV 号绑定，同一个视频续抓时自动对应
-    db路径 = f"评论缓存_{bvid}.db"
+    # 数据库文件名与目标绑定（视频用BV号，动态用dyn+oid），续抓时自动对应
+    db路径 = f"评论缓存_{目标标识}.db"
     db是新的 = not os.path.exists(db路径)
     conn = 初始化数据库(db路径)
 
